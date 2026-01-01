@@ -1,0 +1,100 @@
+# ================= CELL 2: MAP ONLY (SUGGEST OPTIMIZED ROUTE / RESCHEDULE PLAN) =================
+!pip install folium -q
+
+import pandas as pd
+import folium
+
+CHENNAI_CENTER = [13.0827, 80.2707]
+COVERAGE_RADIUS_KM = 100
+
+LOCATIONS = {
+    "Kuthambakkam Center": [13.0827, 80.2707],
+    "Thiruvallur": [13.1939, 80.1234],
+    "Tambaram": [12.9229, 80.1275],
+    "Kanchipuram": [12.8342, 79.7036],
+    "Mahabalipuram": [12.6267, 80.1926],
+    "Avadi": [13.1143, 80.1098],
+    "Porur": [13.0392, 80.1580],
+    "Guindy": [13.0108, 80.2206],
+}
+
+# ------------------------------------------------------------------
+# INPUT FROM PREVIOUS BLOCK (predicted delivery time / delay label)
+# ------------------------------------------------------------------
+with open("pickup_drop.txt", "r") as f:
+    lines = f.read().strip().splitlines()
+pickup_name = lines[0]
+drop_name = lines[1]
+
+route_with_preds = pd.read_csv("route_predictions.csv")
+geo_df = pd.read_pickle("osrm_routes.pkl")
+
+# Sort routes by predicted delivery time (optimization objective)
+route_sorted = route_with_preds.sort_values("Predicted_Delivery_Time_min").reset_index(drop=True)
+route_sorted["Is_Best"] = False
+route_sorted.loc[0, "Is_Best"] = True   # best (optimized) route
+
+start = LOCATIONS[pickup_name]
+end = LOCATIONS[drop_name]
+center = [(start[0] + end[0]) / 2, (start[1] + end[1]) / 2]
+
+# ------------------------------------------------------------------
+# BLOCK : SUGGEST OPTIMIZED ROUTE / RESCHEDULE PLAN (MAP VISUALIZATION)
+# ------------------------------------------------------------------
+m = folium.Map(location=center, zoom_start=11, tiles="OpenStreetMap")
+
+# Coverage / service area ring (optional)
+folium.Circle(
+    CHENNAI_CENTER,
+    radius=COVERAGE_RADIUS_KM * 1000,
+    color="blue",
+    fill=True,
+    fill_color="#3388ff",
+    fill_opacity=0.05,
+    weight=2,
+    dash_array="10,5",
+    popup="100 km coverage",
+).add_to(m)
+
+for idx, row in route_sorted.iterrows():
+    if idx >= len(geo_df):
+        break
+    osrm_coords = geo_df.loc[idx, "Coordinates"]
+    color = "green" if row["Is_Best"] else "red"
+    weight = 5 if row["Is_Best"] else 3
+    opacity = 0.9 if row["Is_Best"] else 0.6
+
+    popup = (
+        f"<b>{row['Route_Name']}</b><br>"
+        f"Distance: {row['Distance_km']:.2f} km<br>"
+        f"Weather: {row['Weather']}<br>"
+        f"Traffic: {row['Traffic_Level']}<br>"
+        f"Time of Day: {row['Time_of_Day']}<br>"
+        f"Vehicle: {row['Vehicle_Type']}<br>"
+        f"Preparation: {row['Preparation_Time_min']} min<br>"
+        f"Experience: {row['Courier_Experience_yrs']} yrs<br>"
+        f"Predicted Delivery Time: <b>{row['Predicted_Delivery_Time_min']} min</b>"
+    )
+
+    folium.PolyLine(
+        osrm_coords,
+        color=color,
+        weight=weight,
+        opacity=opacity,
+        tooltip=f"{row['Route_Name']} – {row['Predicted_Delivery_Time_min']} min",
+        popup=popup,
+    ).add_to(m)
+
+
+folium.Marker(
+    start,
+    popup=f"Pickup: {pickup_name}",
+    icon=folium.Icon(color="blue", icon="info-sign"),
+).add_to(m)
+folium.Marker(
+    end,
+    popup=f"Drop: {drop_name}",
+    icon=folium.Icon(color="red", icon="flag"),
+).add_to(m)
+
+m
