@@ -1,0 +1,337 @@
+# ================= CELL 1: ML TRAINING + (OPTIONAL) ROUTE PREDICTIONS =================
+!pip install xgboost scikit-learn pandas numpy requests ipywidgets -q
+
+import pandas as pd
+import numpy as np
+import requests
+from google.colab import files
+from IPython.display import display, clear_output
+import ipywidgets as widgets
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    mean_absolute_error, mean_squared_error,
+    accuracy_score
+)
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from xgboost import XGBRegressor, XGBClassifier
+
+# ================= 1. UPLOAD CSV (EITHER FILE) =================
+print("📂 Upload Food_Delivery_Times.csv OR Train.csv")
+uploaded = files.upload()
+csv_name = list(uploaded.keys())[0]
+print("Loaded file:", csv_name)
+
+df = pd.read_csv(csv_name)
+print("Columns:", df.columns.tolist())
+display(df.head())
+
+# =====================================================================
+# CASE A: FOOD_DELIVERY_TIMES.CSV  → regression + routes + map support
+# =====================================================================
+if "Distance_km" in df.columns and "Delivery_Time_min" in df.columns:
+    print("\nDetected delivery-time dataset (Food_Delivery_Times style). Running full pipeline...")
+
+    # ---------- DATA & FEATURES ----------
+    target_col = "Delivery_Time_min"
+    feature_cols = [
+        "Distance_km",
+        "Weather",
+        "Traffic_Level",
+        "Time_of_Day",
+        "Vehicle_Type",
+        "Preparation_Time_min",
+        "Courier_Experience_yrs",
+    ]
+
+    data = df[feature_cols + [target_col]].dropna()
+    X = data[feature_cols]
+    y = data[target_col]
+
+    cat_cols = ["Weather", "Traffic_Level", "Time_of_Day", "Vehicle_Type"]
+    num_cols = ["Distance_km", "Preparation_Time_min", "Courier_Experience_yrs"]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+            ("num", "passthrough", num_cols),
+        ]
+    )
+
+    # ---------- MODEL TRAINING (LR, RF, XGB) ----------
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    def build_and_eval_reg(model):
+        pipe = Pipeline(steps=[("prep", preprocessor), ("model", model)])
+        pipe.fit(X_train, y_train)
+        preds = pipe.predict(X_test)
+        mae = mean_absolute_error(y_test, preds)
+        rmse = mean_squared_error(y_test, preds) ** 0.5
+        return pipe, mae, rmse
+
+    models = {}
+    lr, mae_lr, rmse_lr = build_and_eval_reg(LinearRegression())
+    models["Linear Regression"] = (lr, mae_lr, rmse_lr)
+
+    rf, mae_rf, rmse_rf = build_and_eval_reg(
+        RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1)
+    )
+    models["Random Forest"] = (rf, mae_rf, rmse_rf)
+
+    xgb, mae_xgb, rmse_xgb = build_and_eval_reg(
+        XGBRegressor(
+            n_estimators=300,
+            learning_rate=0.08,
+            max_depth=5,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=42,
+            objective="reg:squarederror",
+            n_jobs=-1,
+        )
+    )
+    models["XGBoost"] = (xgb, mae_xgb, rmse_xgb)
+
+    print("=== Regression Model Performance on Delivery_Time_min ===")
+    perf_rows = []
+    for name, (model_obj, mae, rmse) in models.items():
+        perf_rows.append({"Model": name, "MAE": mae, "RMSE": rmse})
+    perf_df = pd.DataFrame(perf_rows)
+    display(perf_df)
+
+    # continue to use XGBoost for route predictions (project requirement)
+    best_model = xgb
+
+    # ---------- OSRM & ROUTE ML (same as before) ----------
+    OSRM_API = "https://router.project-osrm.org/route/v1/driving"
+
+    LOCATIONS = {
+        "Kuthambakkam Center": [13.0827, 80.2707],
+        "Thiruvallur": [13.1939, 80.1234],
+        "Tambaram": [12.9229, 80.1275],
+        "Kanchipuram": [12.8342, 79.7036],
+        "Mahabalipuram": [12.6267, 80.1926],
+        "Avadi": [13.1143, 80.1098],
+        "Porur": [13.0392, 80.1580],
+        "Guindy": [13.0108, 80.2206],
+    }
+
+    def get_osrm_routes(start, end, max_routes=4):
+        try:
+            url = f"{OSRM_API}/{start[1]},{start[0]};{end[1]},{end[0]}"
+            params = {
+                "overview": "full",
+                "geometries": "geojson",
+                "steps": "false",
+                "alternatives": "true",
+            }
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code != 200:
+                print("OSRM HTTP status:", r.status_code)
+                return []
+            data = r.json()
+            if "routes" not in data or not data["routes"]:
+                print("No routes returned by OSRM")
+                return []
+            routes = []
+            for route in data["routes"][:max_routes]:
+                dist_km = route["distance"] / 1000
+                dur_min = route["duration"] / 60
+                coords = [[c[1], c[0]] for c in route["geometry"]["coordinates"]]
+                routes.append({
+                    "distance_km": dist_km,
+                    "duration_min": dur_min,
+                    "coordinates": coords,
+                })
+            return routes
+        except Exception as e:
+            print("OSRM error:", e)
+            return []
+
+    def build_route_profiles_from_osrm(osrm_routes):
+        profiles = [
+            ("Fastest (Highway)",    "Clear", "Low",    "Afternoon", "Scooter", 15, 5.0),
+            ("Balanced",             "Clear", "Medium", "Evening",   "Bike",    20, 3.0),
+            ("Traffic-Aware",        "Clear", "High",   "Evening",   "Bike",    18, 4.0),
+            ("Weather-Safe (Rainy)", "Rainy", "Medium", "Night",     "Car",     22, 6.0),
+        ]
+        rows = []
+        for i, osrm_r in enumerate(osrm_routes):
+            name, weather, traffic, tod, vehicle, prep, exp = profiles[i % len(profiles)]
+            rows.append(
+                {
+                    "Route_Name": name,
+                    "Distance_km": round(osrm_r["distance_km"], 2),
+                    "Weather": weather,
+                    "Traffic_Level": traffic,
+                    "Time_of_Day": tod,
+                    "Vehicle_Type": vehicle,
+                    "Preparation_Time_min": prep,
+                    "Courier_Experience_yrs": exp,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def predict_delivery_times(route_df):
+        X_routes = route_df[feature_cols]
+        preds = best_model.predict(X_routes)
+        route_df["Predicted_Delivery_Time_min"] = np.round(preds, 1)
+        return route_df
+
+    pickup_dd = widgets.Dropdown(
+        options=sorted(LOCATIONS.keys()),
+        description="Pickup:",
+        value="Kuthambakkam Center"
+    )
+    drop_dd = widgets.Dropdown(
+        options=sorted(LOCATIONS.keys()),
+        description="Drop:",
+        value="Thiruvallur"
+    )
+    run_btn = widgets.Button(
+        description="Compute Routes",
+        button_style="success",
+        icon="road"
+    )
+    out = widgets.Output()
+
+    def on_click_run(b):
+        with out:
+            clear_output()
+            pickup_name = pickup_dd.value
+            drop_name = drop_dd.value
+            if pickup_name == drop_name:
+                print("⚠️ Pickup and drop cannot be the same.")
+                return
+
+            start = LOCATIONS[pickup_name]
+            end = LOCATIONS[drop_name]
+
+            osrm_routes = get_osrm_routes(start, end, max_routes=4)
+            if not osrm_routes:
+                print("❌ OSRM did not return any routes.")
+                return
+
+            print(f"✅ Pickup = {pickup_name}, Drop = {drop_name}")
+            print(f"   Got {len(osrm_routes)} OSRM routes:")
+            for i, r in enumerate(osrm_routes):
+                print(f"   Route {i+1}: {r['distance_km']:.2f} km, {r['duration_min']:.1f} min (base)")
+
+            route_features = build_route_profiles_from_osrm(osrm_routes)
+            route_with_preds = predict_delivery_times(route_features)
+
+            print("\n=== XGBoost Route Predictions (fastest will be GREEN on map) ===")
+            display(route_with_preds.sort_values("Predicted_Delivery_Time_min"))
+
+            route_with_preds.to_csv("route_predictions.csv", index=False)
+            geo_df = pd.DataFrame({
+                "Route_Index": list(range(len(osrm_routes))),
+                "Distance_km": [r["distance_km"] for r in osrm_routes],
+                "Duration_min": [r["duration_min"] for r in osrm_routes],
+                "Coordinates": [r["coordinates"] for r in osrm_routes],
+            })
+            geo_df.to_pickle("osrm_routes.pkl")
+
+            with open("pickup_drop.txt", "w") as f:
+                f.write(pickup_name + "\n" + drop_name + "\n")
+
+            print("\n✅ Saved route_predictions.csv, osrm_routes.pkl, pickup_drop.txt for the map cell.")
+
+    run_btn.on_click(on_click_run)
+    display(widgets.VBox([widgets.HBox([pickup_dd, drop_dd, run_btn]), out]))
+
+# =====================================================================
+# CASE B: TRAIN.CSV  → classification metrics only (no routes updated)
+# =====================================================================
+elif "Reached.on.Time_Y.N" in df.columns:
+    print("\nDetected Train.csv (logistics classification dataset). Running metrics only...")
+
+    # basic feature/target choice for Train.csv
+    target_col = "Reached.on.Time_Y.N"
+    feature_cols = [
+        "Warehouse_block",
+        "Mode_of_Shipment",
+        "Customer_care_calls",
+        "Customer_rating",
+        "Cost_of_the_Product",
+        "Prior_purchases",
+        "Product_importance",
+        "Discount_offered",
+        "Weight_in_gms",
+    ]
+
+    data = df[feature_cols + [target_col]].dropna()
+    X = data[feature_cols]
+    y = data[target_col]
+
+    cat_cols = ["Warehouse_block", "Mode_of_Shipment", "Product_importance"]
+    num_cols = [
+        "Customer_care_calls",
+        "Customer_rating",
+        "Cost_of_the_Product",
+        "Prior_purchases",
+        "Discount_offered",
+        "Weight_in_gms",
+    ]
+
+    preprocessor_clf = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+            ("num", "passthrough", num_cols),
+        ]
+    )
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    def build_and_eval_clf(model):
+        pipe = Pipeline(steps=[("prep", preprocessor_clf), ("model", model)])
+        pipe.fit(X_train, y_train)
+        preds = pipe.predict(X_test)
+        acc = accuracy_score(y_test, preds)
+        return pipe, acc
+
+    clf_models = {}
+    lr_clf, acc_lr = build_and_eval_clf(LogisticRegression(max_iter=1000))
+    clf_models["Logistic Regression"] = (lr_clf, acc_lr)
+
+    rf_clf, acc_rf = build_and_eval_clf(
+        RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+    )
+    clf_models["Random Forest"] = (rf_clf, acc_rf)
+
+    xgb_clf, acc_xgb = build_and_eval_clf(
+        XGBClassifier(
+            n_estimators=300,
+            learning_rate=0.08,
+            max_depth=5,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=42,
+            objective="binary:logistic",
+            n_jobs=-1,
+        )
+    )
+    clf_models["XGBoost"] = (xgb_clf, acc_xgb)
+
+    print("=== Classification Model Performance on Reached.on.Time_Y.N ===")
+    rows = []
+    for name, (model_obj, acc) in clf_models.items():
+        rows.append({"Model": name, "Accuracy": acc})
+    display(pd.DataFrame(rows))
+
+    print("\n(For Train.csv no map is updated; Cell 2 will still use the last Food_Delivery_Times run.)")
+
+# =====================================================================
+# OTHER CASE: unsupported CSV
+# =====================================================================
+else:
+    print("\n❌ Uploaded CSV does not match either Food_Delivery_Times or Train schema.")
+    print("Columns found:", df.columns.tolist())
